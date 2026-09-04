@@ -13,7 +13,7 @@ use aws_sdk_s3::{
     types::{BucketLocationConstraint, CreateBucketConfiguration, Delete, ObjectIdentifier},
 };
 use bytes::Bytes;
-use log::info;
+use log::debug;
 use reqwest::get;
 
 #[derive(Clone, Debug)]
@@ -145,7 +145,7 @@ impl S3Client {
             .into_bytes();
 
         // info!(%bucket, %key, bytes = bytes.len(), "downloaded");
-        println!("{}: {} ({} bytes)", bucket, key, bytes.len());
+        debug!("{}: {} ({} bytes)", bucket, key, bytes.len());
         Ok(bytes.to_vec())
     }
 
@@ -172,7 +172,7 @@ impl S3Client {
             }
         }
 
-        println!("{}: {} object(s) under '{}'", bucket, keys.len(), prefix);
+        debug!("{}: {} object(s) under '{}'", bucket, keys.len(), prefix);
         Ok(keys)
     }
 

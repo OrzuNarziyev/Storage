@@ -1,6 +1,8 @@
 mod storage;
 
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use storage::client::S3Client;
 use storage::config::{self, S3Config};
 use tokio::task::JoinSet;
@@ -25,6 +27,11 @@ fn is_image(key: &str) -> bool {
 fn local_path(out_dir: &str, prefix: &str, key: &str) -> PathBuf {
     let rel = key.strip_prefix(prefix).unwrap_or(key).trim_start_matches('/');
     Path::new(out_dir).join(rel)
+}
+
+/// Just the file name, for the progress bar message.
+fn file_name(key: &str) -> String {
+    key.rsplit('/').next().unwrap_or(key).to_string()
 }
 
 #[tokio::main]
@@ -53,7 +60,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bucket = cfg.bucket.clone();
     let client = S3Client::new(cfg).await?;
 
+    // Listing can take a while on large prefixes — show a spinner meanwhile.
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(ProgressStyle::with_template("{spinner:.green} {msg}")?);
+    spinner.enable_steady_tick(Duration::from_millis(100));
+    spinner.set_message(format!("Listing objects under '{}'...", prefix));
+
     let keys = client.list_objects(&bucket, &prefix).await?;
+    spinner.finish_and_clear();
+
     let (images, skipped): (Vec<String>, Vec<String>) =
         keys.into_iter().partition(|k| is_image(k));
 
@@ -66,12 +81,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::fs::create_dir_all(&out_dir)?;
-    println!("Downloading {} image(s) into '{}/'...", images.len(), out_dir);
+
+    let pb = ProgressBar::new(images.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({percent}%) eta {eta} {msg}",
+        )?
+        .progress_chars("=>-"),
+    );
+    pb.enable_steady_tick(Duration::from_millis(120));
 
     let mut tasks: JoinSet<Result<(String, usize), (String, String)>> = JoinSet::new();
     let mut queue = images.into_iter();
     let mut downloaded = 0usize;
     let mut failed = 0usize;
+    let mut total_bytes = 0u64;
 
     // Keep at most `concurrency` downloads in flight.
     for _ in 0..concurrency {
@@ -84,22 +108,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match joined? {
             Ok((key, bytes)) => {
                 downloaded += 1;
-                println!("  ok   {} ({} bytes)", key, bytes);
+                total_bytes += bytes as u64;
+                pb.set_message(file_name(&key));
             }
             Err((key, msg)) => {
                 failed += 1;
-                eprintln!("  fail {}: {}", key, msg);
+                // println! on the bar prints above it without breaking the render.
+                pb.println(format!("  fail {}: {}", key, msg));
             }
         }
+        pb.inc(1);
 
         if let Some(key) = queue.next() {
             spawn_download(&mut tasks, &client, &bucket, &out_dir, &prefix, key);
         }
     }
 
+    pb.finish_with_message("done");
     println!(
-        "Done: {} downloaded, {} failed -> {}/",
-        downloaded, failed, out_dir
+        "Downloaded {} file(s) ({}), {} failed -> {}/",
+        downloaded,
+        HumanBytes(total_bytes),
+        failed,
+        out_dir
     );
     Ok(())
 }
@@ -138,6 +169,16 @@ fn spawn_download(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_templates_are_valid() {
+        ProgressStyle::with_template("{spinner:.green} {msg}").unwrap();
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({percent}%) eta {eta} {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-");
+    }
 
     #[test]
     fn local_path_keeps_structure_under_prefix() {
