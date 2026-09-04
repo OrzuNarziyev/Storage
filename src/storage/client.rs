@@ -14,7 +14,7 @@ use aws_sdk_s3::{
 };
 use bytes::Bytes;
 use std::time::Duration;
-use log::info;
+use log::debug;
 use reqwest::get;
 
 #[derive(Clone, Debug)]
@@ -154,7 +154,7 @@ impl S3Client {
             .into_bytes();
 
         // info!(%bucket, %key, bytes = bytes.len(), "downloaded");
-        println!("{}: {} ({} bytes)", bucket, key, bytes.len());
+        debug!("{}: {} ({} bytes)", bucket, key, bytes.len());
         Ok(bytes.to_vec())
     }
 
@@ -222,7 +222,7 @@ impl S3Client {
             }
         }
 
-        println!(
+        debug!(
             "{}: {} object(s) under '{}' in {} page(s)",
             bucket,
             keys.len(),
