@@ -10,7 +10,9 @@ use aws_sdk_s3::{
     error::SdkError,
     operation::{create_bucket::CreateBucketError, delete_objects::DeleteObjectsOutput},
     primitives::ByteStream,
-    types::{BucketLocationConstraint, CreateBucketConfiguration, Delete, ObjectIdentifier},
+    types::{
+        BucketLocationConstraint, CreateBucketConfiguration, Delete, Object, ObjectIdentifier,
+    },
 };
 use bytes::Bytes;
 use std::time::Duration;
@@ -176,8 +178,37 @@ impl S3Client {
         F: FnMut(usize),
     {
         let mut keys = Vec::new();
+        self.for_each_page(bucket, prefix, |objects| {
+            for obj in objects {
+                if let Some(key) = obj.key() {
+                    // MinIO/S3 represent "folders" as zero-byte keys ending in '/'.
+                    if !key.ends_with('/') {
+                        keys.push(key.to_string());
+                    }
+                }
+            }
+            on_page(keys.len());
+        })
+        .await?;
+        Ok(keys)
+    }
+
+    /// Walk a prefix page by page, handing each page's objects to `on_page` as
+    /// they arrive and returning the number of requests it took. Nothing is
+    /// retained here, so a caller that only tallies keeps memory flat however
+    /// many objects the prefix holds.
+    pub async fn for_each_page<F>(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        mut on_page: F,
+    ) -> S3Result<usize>
+    where
+        F: FnMut(&[Object]),
+    {
         let mut token: Option<String> = None;
         let mut pages = 0usize;
+        let mut seen = 0usize;
 
         loop {
             let mut req = self
@@ -192,16 +223,8 @@ impl S3Client {
 
             let resp = req.send().await.map_err(S3Error::from)?;
             pages += 1;
-
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    // MinIO/S3 represent "folders" as zero-byte keys ending in '/'.
-                    if !key.ends_with('/') {
-                        keys.push(key.to_string());
-                    }
-                }
-            }
-            on_page(keys.len());
+            seen += resp.contents().len();
+            on_page(resp.contents());
 
             if !resp.is_truncated().unwrap_or(false) {
                 break;
@@ -213,23 +236,17 @@ impl S3Client {
                 // Some S3-compatible servers echo the cursor back unchanged;
                 // following it would spin here forever.
                 Some(t) if Some(t) == token.as_deref() => {
-                    return Err(S3Error::ListingStalled {
-                        pages,
-                        keys: keys.len(),
-                    });
+                    return Err(S3Error::ListingStalled { pages, keys: seen });
                 }
                 Some(t) => token = Some(t.to_string()),
             }
         }
 
         debug!(
-            "{}: {} object(s) under '{}' in {} page(s)",
-            bucket,
-            keys.len(),
-            prefix,
-            pages
+            "{}: walked '{}' — {} object(s) in {} page(s)",
+            bucket, prefix, seen, pages
         );
-        Ok(keys)
+        Ok(pages)
     }
 
     /// Delete a single object (idempotent — missing key is not an error).
