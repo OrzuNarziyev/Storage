@@ -17,14 +17,24 @@ pub struct S3Config {
     pub bucket: String,
 
     pub api_key: Option<String>,
+
+    /// Per-request timeout. Guards against a wedged endpoint hanging forever.
+    pub request_timeout_secs: u64,
+    /// TCP connect timeout.
+    pub connect_timeout_secs: u64,
 }
+
+/// Defaults for the timeout knobs, in seconds.
+const DEFAULT_REQUEST_TIMEOUT: u64 = 60;
+const DEFAULT_CONNECT_TIMEOUT: u64 = 10;
 
 impl S3Config {
     /// Read the config from the environment. Call [`load_dotenv`] first if you
     /// want values from a `.env` file to be picked up.
     ///
     /// Required: `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`.
-    /// Optional: `S3_REGION` (defaults to `us-east-1`), `S3_API_KEY`.
+    /// Optional: `S3_REGION` (defaults to `us-east-1`), `S3_API_KEY`,
+    /// `S3_REQUEST_TIMEOUT_SECS`, `S3_CONNECT_TIMEOUT_SECS`.
     pub fn from_env() -> S3Result<Self> {
         Ok(Self {
             endpoint_url: required("S3_ENDPOINT_URL")?,
@@ -33,6 +43,8 @@ impl S3Config {
             secret_key: required("S3_SECRET_KEY")?,
             bucket: required("S3_BUCKET")?,
             api_key: optional("S3_API_KEY"),
+            request_timeout_secs: secs("S3_REQUEST_TIMEOUT_SECS", DEFAULT_REQUEST_TIMEOUT),
+            connect_timeout_secs: secs("S3_CONNECT_TIMEOUT_SECS", DEFAULT_CONNECT_TIMEOUT),
         })
     }
 }
@@ -49,6 +61,13 @@ pub fn load_dotenv() {
 
 fn required(key: &str) -> S3Result<String> {
     optional(key).ok_or_else(|| S3Error::MissingEnv(key.to_string()))
+}
+
+fn secs(key: &str, default: u64) -> u64 {
+    optional(key)
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
 }
 
 /// An unset variable and an empty/whitespace one are treated the same.

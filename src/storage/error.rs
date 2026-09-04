@@ -37,6 +37,10 @@ pub enum S3Error {
 
     #[error("missing environment variable: {0} (see example.env)")]
     MissingEnv(String),
+
+    #[error("listing stalled after {pages} page(s) / {keys} key(s): the server \
+             repeated its continuation token instead of advancing")]
+    ListingStalled { pages: usize, keys: usize },
 }
 
 pub type S3Result<T> = Result<T, S3Error>;
