@@ -1,7 +1,6 @@
 mod storage;
 
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use storage::client::S3Client;
@@ -24,38 +23,15 @@ fn is_image(key: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Just the file name, dropping the key's folders.
-fn file_name(key: &str) -> &str {
-    key.rsplit('/').next().unwrap_or(key)
+/// Local path for a key: everything after the prefix, kept under `out_dir`.
+fn local_path(out_dir: &str, prefix: &str, key: &str) -> PathBuf {
+    let rel = key.strip_prefix(prefix).unwrap_or(key).trim_start_matches('/');
+    Path::new(out_dir).join(rel)
 }
 
-/// Every image lands straight in `out_dir`, no sub-folders. Keys from
-/// different S3 folders can share a file name, so a repeat gets a `_2`,
-/// `_3`, ... suffix instead of overwriting the file already there.
-fn flat_paths(out_dir: &str, keys: &[String]) -> Vec<PathBuf> {
-    let mut taken: HashSet<String> = HashSet::with_capacity(keys.len());
-
-    keys.iter()
-        .map(|key| {
-            let name = file_name(key);
-            let stem = Path::new(name)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(name);
-            let ext = Path::new(name).extension().and_then(|e| e.to_str());
-
-            let mut candidate = name.to_string();
-            let mut n = 2;
-            while !taken.insert(candidate.clone()) {
-                candidate = match ext {
-                    Some(ext) => format!("{}_{}.{}", stem, n, ext),
-                    None => format!("{}_{}", stem, n),
-                };
-                n += 1;
-            }
-            Path::new(out_dir).join(candidate)
-        })
-        .collect()
+/// Just the file name, for the progress bar message.
+fn file_name(key: &str) -> String {
+    key.rsplit('/').next().unwrap_or(key).to_string()
 }
 
 #[tokio::main]
@@ -90,14 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spinner.enable_steady_tick(Duration::from_millis(100));
     spinner.set_message(format!("Listing objects under '{}'...", prefix));
 
-    // Report the running count: a broad prefix takes one round-trip per 1,000
-    // keys, and without this the listing looks like a freeze.
-    let keys = client
-        .list_objects_with(&bucket, &prefix, |found| {
-            spinner.set_message(format!("Listing '{}'... {} object(s) so far", prefix, found))
-        })
-        .await?;
+    let keys = client.list_objects(&bucket, &prefix).await?;
     spinner.finish_and_clear();
+
     let (images, skipped): (Vec<String>, Vec<String>) =
         keys.into_iter().partition(|k| is_image(k));
 
@@ -110,7 +81,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::fs::create_dir_all(&out_dir)?;
-    let paths = flat_paths(&out_dir, &images);
 
     let pb = ProgressBar::new(images.len() as u64);
     pb.set_style(
@@ -122,15 +92,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pb.enable_steady_tick(Duration::from_millis(120));
 
     let mut tasks: JoinSet<Result<(String, usize), (String, String)>> = JoinSet::new();
-    let mut queue = images.into_iter().zip(paths);
+    let mut queue = images.into_iter();
     let mut downloaded = 0usize;
     let mut failed = 0usize;
     let mut total_bytes = 0u64;
 
     // Keep at most `concurrency` downloads in flight.
     for _ in 0..concurrency {
-        if let Some((key, path)) = queue.next() {
-            spawn_download(&mut tasks, &client, &bucket, key, path);
+        if let Some(key) = queue.next() {
+            spawn_download(&mut tasks, &client, &bucket, &out_dir, &prefix, key);
         }
     }
 
@@ -139,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok((key, bytes)) => {
                 downloaded += 1;
                 total_bytes += bytes as u64;
-                pb.set_message(file_name(&key).to_string());
+                pb.set_message(file_name(&key));
             }
             Err((key, msg)) => {
                 failed += 1;
@@ -149,8 +119,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         pb.inc(1);
 
-        if let Some((key, path)) = queue.next() {
-            spawn_download(&mut tasks, &client, &bucket, key, path);
+        if let Some(key) = queue.next() {
+            spawn_download(&mut tasks, &client, &bucket, &out_dir, &prefix, key);
         }
     }
 
@@ -169,11 +139,13 @@ fn spawn_download(
     tasks: &mut JoinSet<Result<(String, usize), (String, String)>>,
     client: &S3Client,
     bucket: &str,
+    out_dir: &str,
+    prefix: &str,
     key: String,
-    path: PathBuf,
 ) {
     let client = client.clone();
     let bucket = bucket.to_string();
+    let path = local_path(out_dir, prefix, &key);
 
     tasks.spawn(async move {
         let bytes = client
@@ -181,7 +153,11 @@ fn spawn_download(
             .await
             .map_err(|e| (key.clone(), e.to_string()))?;
 
-        // out_dir is created once up front, so the write needs no mkdir here.
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| (key.clone(), e.to_string()))?;
+        }
         tokio::fs::write(&path, &bytes)
             .await
             .map_err(|e| (key.clone(), e.to_string()))?;
@@ -205,30 +181,9 @@ mod tests {
     }
 
     #[test]
-    fn files_land_flat_in_the_output_dir() {
-        let keys = vec!["2026/09/03/uid/a.jpeg".to_string()];
-        assert_eq!(flat_paths("data", &keys), vec![PathBuf::from("data/a.jpeg")]);
-    }
-
-    #[test]
-    fn repeated_names_get_a_suffix_instead_of_overwriting() {
-        let keys = vec![
-            "x/a.jpeg".to_string(),
-            "y/a.jpeg".to_string(),
-            "z/a.jpeg".to_string(),
-            "w/noext".to_string(),
-            "v/noext".to_string(),
-        ];
-        assert_eq!(
-            flat_paths("data", &keys),
-            vec![
-                PathBuf::from("data/a.jpeg"),
-                PathBuf::from("data/a_2.jpeg"),
-                PathBuf::from("data/a_3.jpeg"),
-                PathBuf::from("data/noext"),
-                PathBuf::from("data/noext_2"),
-            ]
-        );
+    fn local_path_keeps_structure_under_prefix() {
+        let p = local_path("data", "2026/09/03/", "2026/09/03/uid/a.jpeg");
+        assert_eq!(p, Path::new("data/uid/a.jpeg"));
     }
 
     #[test]

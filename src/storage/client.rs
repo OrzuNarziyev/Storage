@@ -6,14 +6,13 @@ use aws_config::BehaviorVersion;
 use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
 use aws_sdk_s3::{
     Client,
-    config::{Builder as S3ConfigBuilder, Region, timeout::TimeoutConfig},
+    config::{Builder as S3ConfigBuilder, Region},
     error::SdkError,
     operation::{create_bucket::CreateBucketError, delete_objects::DeleteObjectsOutput},
     primitives::ByteStream,
     types::{BucketLocationConstraint, CreateBucketConfiguration, Delete, ObjectIdentifier},
 };
 use bytes::Bytes;
-use std::time::Duration;
 use log::debug;
 use reqwest::get;
 
@@ -35,18 +34,10 @@ impl S3Client {
             .load()
             .await;
 
-        // Without these a request against an unreachable or wedged endpoint
-        // blocks forever instead of returning an error.
-        let timeouts = TimeoutConfig::builder()
-            .connect_timeout(Duration::from_secs(cfg.connect_timeout_secs))
-            .operation_attempt_timeout(Duration::from_secs(cfg.request_timeout_secs))
-            .build();
-
         // force_path_style = true is REQUIRED for MinIO / RustFS / Ceph
         let s3_cfg = S3ConfigBuilder::from(&sdk_config)
             .endpoint_url(&cfg.endpoint_url)
             .force_path_style(true)
-            .timeout_config(timeouts)
             .build();
 
         let client = Client::from_conf(s3_cfg);
@@ -160,40 +151,18 @@ impl S3Client {
 
     /// List every object key under `prefix`, following pagination to the end.
     pub async fn list_objects(&self, bucket: &str, prefix: &str) -> S3Result<Vec<String>> {
-        self.list_objects_with(bucket, prefix, |_| {}).await
-    }
-
-    /// Same as [`Self::list_objects`], but reports the running key count after
-    /// every page. A broad prefix can take thousands of round-trips, so callers
-    /// need a way to show that something is happening.
-    pub async fn list_objects_with<F>(
-        &self,
-        bucket: &str,
-        prefix: &str,
-        mut on_page: F,
-    ) -> S3Result<Vec<String>>
-    where
-        F: FnMut(usize),
-    {
         let mut keys = Vec::new();
-        let mut token: Option<String> = None;
-        let mut pages = 0usize;
+        let mut pages = self
+            .inner
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .into_paginator()
+            .send();
 
-        loop {
-            let mut req = self
-                .inner
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix)
-                .max_keys(1000);
-            if let Some(t) = &token {
-                req = req.continuation_token(t);
-            }
-
-            let resp = req.send().await.map_err(S3Error::from)?;
-            pages += 1;
-
-            for obj in resp.contents() {
+        while let Some(page) = pages.next().await {
+            let page = page.map_err(S3Error::from)?;
+            for obj in page.contents() {
                 if let Some(key) = obj.key() {
                     // MinIO/S3 represent "folders" as zero-byte keys ending in '/'.
                     if !key.ends_with('/') {
@@ -201,34 +170,9 @@ impl S3Client {
                     }
                 }
             }
-            on_page(keys.len());
-
-            if !resp.is_truncated().unwrap_or(false) {
-                break;
-            }
-
-            match resp.next_continuation_token() {
-                // Truncated, but the server gave us no cursor to continue from.
-                None => break,
-                // Some S3-compatible servers echo the cursor back unchanged;
-                // following it would spin here forever.
-                Some(t) if Some(t) == token.as_deref() => {
-                    return Err(S3Error::ListingStalled {
-                        pages,
-                        keys: keys.len(),
-                    });
-                }
-                Some(t) => token = Some(t.to_string()),
-            }
         }
 
-        debug!(
-            "{}: {} object(s) under '{}' in {} page(s)",
-            bucket,
-            keys.len(),
-            prefix,
-            pages
-        );
+        debug!("{}: {} object(s) under '{}'", bucket, keys.len(), prefix);
         Ok(keys)
     }
 
